@@ -384,7 +384,6 @@ def _(adjusted_dataset, operation_dataset, target_per_hour):
     hourly_ = create_operation_summary(operation_dataset=operation_dataset).with_columns((pl.col("tonnage_per_hour")-pl.lit(target_per_hour.value)).round(1).alias("🎯"))
 
     adj_hourly_ = create_operation_summary(operation_dataset=adjusted_dataset).with_columns((pl.col("tonnage_per_hour")-pl.lit(target_per_hour.value)).round(1).alias("🎯"))
-
     return adj_hourly_, hourly_
 
 
