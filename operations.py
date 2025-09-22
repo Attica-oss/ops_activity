@@ -31,11 +31,12 @@ def loadgooglesheetdata(logger):
         operations_raw_data = gsheet.load_sheet(config_name="Operations_Activity").data
         customers = gsheet.load_sheet(config_name="customer").data
         transfer = gsheet.load_sheet(config_name="Transfer").data
+        tipping_truck = gsheet.load_sheet(config_name="tipping_truck")
         logger.info("Successfully loaded data from Google Sheets")
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
         mo.stop("❌ Failed to load data from Google Sheets. Please check your connection.")
-    return customers, operations_raw_data, transfer
+    return customers, operations_raw_data, tipping_truck, transfer
 
 
 @app.cell
@@ -114,6 +115,104 @@ def _(logger):
 def _(clean_ops_data, operations_raw_data):
     operation_dataset = clean_ops_data(operations_raw_data).collect()
     return (operation_dataset,)
+
+
+@app.cell
+def _(tipping_truck):
+    # CCCS adjusted records
+
+
+    cccs_record = (
+
+        tipping_truck.data.filter(pl.col("operation_type").eq("To CCCS via Truck"))
+        .with_columns(
+            destination="CCCS ("
+            + pl.col("customer").str.replace(" S.A", "").cast(pl.Utf8)
+            + ")"
+        )
+        .select(
+            pl.col("day"),
+            pl.col("date"),
+            pl.col("movement_type"),
+            pl.col("destination"),
+            pl.col("vessel"),
+            pl.col("total_tonnage"),
+            pl.col("overtime_tonnage")
+        )
+        .collect()
+    )
+    return (cccs_record,)
+
+
+@app.cell
+def _(cccs_record, operation_dataset):
+    # Adjusted Tonnage
+
+
+    adjusted_tonnage = (
+        operation_dataset.filter(pl.col("destination").str.contains("CCCS"))
+        .select(
+            pl.all(),
+            pl.col("tonnage")
+            .sum()
+            .over(["date", "vessel", "destination", "overtime", "Storage"])
+            .alias("tons"),
+        )
+        .with_columns(
+            tonnage_select=pl.when(
+                (
+                    (pl.col("Day").is_in(["Sun", "PH"])).and_(
+                        pl.col("overtime").eq("overtime 150%")
+                    )
+                ).or_(pl.col("overtime") == "normal hours")
+            )
+            .then(pl.lit("normal"))
+            .when(
+                (pl.col("overtime") == "overtime 150%")
+                | (pl.col("overtime") == "overtime 200%")
+            )
+            .then(pl.lit("overtime"))
+            .otherwise(pl.lit("ERR"))
+        )
+        .join(cccs_record, on=["date", "destination", "vessel"], how="left")
+        .with_columns(
+            normal_tonnage=pl.col("total_tonnage") - pl.col("overtime_tonnage")
+        )
+        .with_columns(
+            perc_diff=pl.when(pl.col("tonnage_select") == "normal")
+            .then(pl.col("normal_tonnage") / pl.col("tons"))
+            .otherwise(pl.col("overtime_tonnage") / pl.col("tons"))
+        )
+        .with_columns(tonnage=(pl.col("tonnage") * pl.col("perc_diff")).round(4))
+        .drop(
+            [
+                "tons",
+                "tonnage_select",
+                "day",
+                "movement_type",
+                "total_tonnage",
+                "overtime_tonnage",
+                "normal_tonnage",
+                "perc_diff",
+            ]
+        )
+    )
+    return (adjusted_tonnage,)
+
+
+@app.cell
+def _(adjusted_tonnage, operation_dataset):
+    # Adjusted Dataset
+
+
+    adjusted_dataset = pl.concat(
+        [
+            operation_dataset.filter(~pl.col("destination").str.contains("CCCS")),
+            adjusted_tonnage,
+        ],
+        how="vertical",
+    ).sort(by=["date", "time"])
+    return (adjusted_dataset,)
 
 
 @app.function
@@ -204,9 +303,10 @@ def _(operation_dataset, selected_vessel):
             mo.stop(f"❌ No data found for vessel: {selected_vessel}")
 
         # Get available dates with proper formatting
-        available_dates = (filtered_data
-            .select(pl.col("date").dt.to_string("%d/%m/%Y").unique())
-            .sort(pl.col("date"))
+        available_dates = (
+            filtered_data
+            .select(pl.col("date").dt.to_string(format="%d/%m/%Y").unique())
+            .sort(pl.col("date").str.to_date(format="%d/%m/%Y"))
             .to_series()
             .to_list()
         )
@@ -217,7 +317,8 @@ def _(operation_dataset, selected_vessel):
     # Enhanced date dropdown
     date_dropdown = mo.ui.dropdown(
         label=f"📅 Available dates for {selected_vessel} ({len(available_dates)} days)",
-        options=available_dates
+        options=available_dates,
+        searchable=True
     )
 
     date_dropdown
@@ -279,19 +380,48 @@ def _(date_dropdown):
 
 
 @app.cell
-def _(operation_dataset, target_per_hour):
+def _(adjusted_dataset, operation_dataset, target_per_hour):
     hourly_ = create_operation_summary(operation_dataset=operation_dataset).with_columns((pl.col("tonnage_per_hour")-pl.lit(target_per_hour.value)).round(1).alias("🎯"))
-    return (hourly_,)
+
+    adj_hourly_ = create_operation_summary(operation_dataset=adjusted_dataset).with_columns((pl.col("tonnage_per_hour")-pl.lit(target_per_hour.value)).round(1).alias("🎯"))
+
+    return adj_hourly_, hourly_
 
 
 @app.cell
-def _(date_dropdown, date_string_to_date, hourly_, vessel_dropdown):
-    hourly_filtered = hourly_.filter(
-        pl.col("date").eq(date_string_to_date(date_dropdown.value)),
-        pl.col("vessel").eq(vessel_dropdown.value),
-    ).drop(["date", "vessel"]).with_columns(total_tonnage=pl.col("tonnage_per_hour").cum_sum().round(3))
+def _():
+    hourly_selected_adj = mo.ui.checkbox(label="adjusted")
+    return (hourly_selected_adj,)
 
-    mo.ui.table(hourly_filtered)
+
+@app.cell
+def _(
+    adj_hourly_,
+    date_dropdown,
+    date_string_to_date,
+    hourly_,
+    hourly_selected_adj,
+    vessel_dropdown,
+):
+    hourly_filtered = None
+
+    if hourly_selected_adj.value:
+        hourly_filtered = hourly_.filter(
+            pl.col("date").eq(date_string_to_date(date_dropdown.value)),
+            pl.col("vessel").eq(vessel_dropdown.value),
+        ).drop(["date", "vessel"]).with_columns(total_tonnage=pl.col("tonnage_per_hour").cum_sum().round(3))
+
+
+    else:
+        hourly_filtered = adj_hourly_.filter(
+            pl.col("date").eq(date_string_to_date(date_dropdown.value)),
+            pl.col("vessel").eq(vessel_dropdown.value),
+        ).drop(["date", "vessel"]).with_columns(total_tonnage=pl.col("tonnage_per_hour").cum_sum().round(3))
+
+    mo.vstack([
+        hourly_selected_adj,
+        mo.ui.table(hourly_filtered)
+    ])
     return
 
 
@@ -312,22 +442,62 @@ def _(date_dropdown, date_string_to_date, operation_dataset, vessel_dropdown):
     ).drop("Storage").pivot(
         "species", index="destination", values="tonnage", aggregate_function="sum"
     ).with_columns(total=pl.sum_horizontal(cs.numeric()).round(3))
-    return (daily_,)
+    return cs, daily_
 
 
 @app.cell
-def _(daily_, date_dropdown, vessel_dropdown):
+def _(
+    adjusted_dataset,
+    cs,
+    date_dropdown,
+    date_string_to_date,
+    vessel_dropdown,
+):
+    adj_daily_ = adjusted_dataset.filter(
+        pl.col("date").eq(date_string_to_date(date_dropdown.value)),
+        pl.col("vessel").eq(vessel_dropdown.value),
+    ).group_by(
+        pl.col("destination"),
+        pl.col("species"),
+        pl.col("Storage"),
+        maintain_order=True,
+    ).agg(pl.col("tonnage").sum().round(3)).with_columns(
+        species=pl.col("species") + "\n" + pl.col("Storage").cast(pl.Utf8)
+    ).drop("Storage").pivot(
+        "species", index="destination", values="tonnage", aggregate_function="sum"
+    ).with_columns(total=pl.sum_horizontal(cs.numeric()).round(3))
+    return (adj_daily_,)
+
+
+@app.cell
+def _():
+    adjusted_check = mo.ui.checkbox(label="Adjusted")
+    return (adjusted_check,)
+
+
+@app.cell
+def _(adj_daily_, adjusted_check, daily_, date_dropdown, vessel_dropdown):
     date_daily = date_dropdown.value
     vessel_daily = vessel_dropdown.value
 
+
+    df_daily = None
+
+    if adjusted_check.value:
+        df_daily = adj_daily_
+    else:
+        df_daily = daily_
 
     mo.vstack(
         [
             mo.md("# Daily Unloading Report"),
             f"Vessel: {vessel_daily}",
             f"Date: {date_daily}",
-            mo.ui.table(daily_),
-            mo.md(f"## Total: {daily_.select(pl.col("total").sum().round(3)).to_series().to_list()[0]}")
+            adjusted_check,
+            mo.ui.table(df_daily),
+            mo.md(
+                f"## Total: {df_daily.select(pl.col('total').sum().round(3)).to_series().to_list()[0]}"
+            ),
         ]
     )
     return
@@ -379,8 +549,16 @@ def _(operation_with_kind):
 
 
 @app.cell
+def _(date_dropdown, date_string_to_date, summarised_ops, vessel_dropdown):
+    view = summarised_ops.filter(pl.col("date").eq(date_string_to_date(date_dropdown.value)).and_(pl.col("vessel").eq(vessel_dropdown.value))).unpivot(index=["date","vessel"], variable_name="operation_type", value_name="tonnage").filter(pl.col("tonnage").ne(0)).drop(["date","vessel"])
+
+    mo.vstack([mo.md("# Summarised View"),view])
+    return
+
+
+@app.cell
 def _(summarised_ops):
-    mo.vstack([mo.md("# Operations Activity"),mo.ui.table(summarised_ops)])
+    mo.vstack([mo.md("# Operations Activity"),mo.ui.dataframe(summarised_ops)])
     return
 
 
