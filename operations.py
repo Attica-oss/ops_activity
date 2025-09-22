@@ -170,14 +170,18 @@ def _(customers):
         searchable=True,
         label="🚢 Select Vessel"
     )
+
+    # Enhanced UI layout
+    title = mo.md("# 📊 Hourly Operations Analysis")
+    sub_title = mo.md("Select a vessel to view hourly tonnage performance")
+
+    mo.vstack([title,sub_title,vessel_dropdown])
     return (vessel_dropdown,)
 
 
 @app.cell
 def _(vessel_dropdown):
-    # Enhanced UI layout
-    title = mo.md("# 📊 Hourly Operations Analysis")
-    sub_title = mo.md("Select a vessel to view hourly tonnage performance")
+
 
 
 
@@ -186,9 +190,6 @@ def _(vessel_dropdown):
         mo.stop("👆 Please select a vessel to continue")
 
     selected_vessel = vessel_dropdown.value
-
-
-    mo.vstack([title,sub_title,vessel_dropdown])
     return (selected_vessel,)
 
 
